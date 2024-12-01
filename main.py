@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from Logger.logger_factory import LoggerFactory
 from Logger.dummy_logger import DummyLogger
 
+
 def get_bool_env_variable(name: str, default_value: bool | None = None) -> bool:
     true_ = ('true', '1', 't')
     false_ = ('false', '0', 'f')
@@ -36,8 +37,6 @@ async def main():
     page = await service.get_page(pages[selected_index])
     word2 = InputProcessor.get_word()
 
-
-
     if not pages:
         print(f"The pages '{word1}' does not exist.")
         return None
@@ -50,7 +49,6 @@ async def main():
         print(f"The distance between '{word1}' and '{word2}' is {distance}.")
     else:
         print(f"The distance between '{word1}' and '{word2}' could not be calculated.")
-
 
 
 if __name__ == "__main__":

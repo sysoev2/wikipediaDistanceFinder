@@ -1,7 +1,7 @@
 import asyncio
 from asyncio import Queue
 from concurrent.futures import ProcessPoolExecutor
-from typing import final
+from typing import Set, Dict, Optional, final
 
 from Logger.logger_interface import LoggerInterface
 from Wikipedia.wikipedia_page import WikipediaPage
@@ -10,27 +10,21 @@ from Wikipedia.wikipedia_service import AsyncWikipediaService
 
 @final
 class Worker:
-    __queue: Queue
-    __logger: LoggerInterface
-    __api: AsyncWikipediaService
-    __visited: set
-    __succeed_distance: dict
-    __distance_by_page: dict
-    __executor: ProcessPoolExecutor
-    __worker_id: int
-    __target_word: str
+    TIMEOUT = 1
+    MAX_TIMEOUTS = 5
+    NO_DISTANCE = 0
 
     def __init__(
-            self,
-            queue: Queue,
-            logger: LoggerInterface,
-            api: AsyncWikipediaService,
-            visited: set,
-            succeed_distance: dict,
-            distance_by_page: dict,
-            executor: ProcessPoolExecutor,
-            worker_id: int,
-            target_word: str
+        self,
+        queue: Queue,
+        logger: LoggerInterface,
+        api: AsyncWikipediaService,
+        visited: Set[str],
+        succeed_distance: Dict[str, int],
+        distance_by_page: Dict[str, int],
+        executor: ProcessPoolExecutor,
+        worker_id: int,
+        target_word: str,
     ):
         self.__queue = queue
         self.__logger = logger
@@ -42,46 +36,68 @@ class Worker:
         self.__target_word = target_word
         self.__succeed_distance = succeed_distance
 
-    async def process(self):
-        self.__logger.info(f"process Worker:{self.__worker_id}")
+    async def process(self) -> Optional[int]:
+        self.__logger.info(f"Worker {self.__worker_id} started processing.")
         timeout_count = 0
+
         while True:
-            try:
-                current_page: WikipediaPage = await asyncio.wait_for(self.__queue.get(), timeout=1)
-            except:
-                if timeout_count >= 5:
-                    self.__logger.info(f"Worker {self.__worker_id}: failed.")
-                    self.__queue.task_done()
-                    return None
-                self.__logger.info(f"Worker {self.__worker_id}: Timeout.")
-                timeout_count += 1
-                continue
+            page = await self.__get_next_page(timeout_count)
+            if page is None:
+                return None
 
             timeout_count = 0
+            if await self.__process_page(page):
+                return self.__succeed_distance["distance"]
 
-            current_distance = self.__distance_by_page[current_page.title.lower()]
-            if self.__succeed_distance['distance'] != 0 and self.__succeed_distance['distance'] <= current_distance:
-                continue
-            distance = current_distance + 1
-            for page in current_page.links:
-                self.__logger.debug(f"Worker {self.__worker_id}: {page} - {distance}")
-                if self.__succeed_distance['distance'] != 0 and self.__succeed_distance['distance'] <= distance:
-                    continue
-                if page.lower() not in self.__visited:
-                    page = await self.__api.get_page(page)
-                    if page is None:
-                        continue
-                    if page.word_in_content(self.__target_word):
-                        self.__logger.info(f"Worker {self.__worker_id}: Found target word. {page.title} - {distance}")
-                        if (
-                                self.__succeed_distance['distance'] != 0
-                                and self.__succeed_distance['distance'] > distance
-                        ):
-                            self.__succeed_distance['distance'] = distance
-                        elif self.__succeed_distance['distance'] == 0:
-                            self.__succeed_distance['distance'] = distance
-                        return distance
-                    self.__visited.add(page.title.lower())
-                    await self.__queue.put(page)
-                    self.__distance_by_page[page.title.lower()] = distance
-        return None
+    async def __get_next_page(self, timeout_count: int) -> Optional[WikipediaPage]:
+        try:
+            return await asyncio.wait_for(self.__queue.get(), timeout=self.TIMEOUT)
+        except asyncio.TimeoutError:
+            if timeout_count >= self.MAX_TIMEOUTS:
+                self.__logger.info(f"Worker {self.__worker_id}: Max timeouts reached. Exiting.")
+                self.__queue.task_done()
+                return None
+            self.__logger.warning(f"Worker {self.__worker_id}: Timeout {timeout_count + 1}.")
+            return None
+
+    async def __process_page(self, current_page: WikipediaPage) -> bool:
+        current_distance = self.__distance_by_page[current_page.title.lower()]
+
+        if self.__should_skip_distance(current_distance):
+            return False
+
+        for linked_page_title in current_page.links:
+            if await self.__process_linked_page(linked_page_title, current_distance):
+                return True
+        return False
+
+    def __should_skip_distance(self, current_distance: int) -> bool:
+        succeed_distance = self.__succeed_distance["distance"]
+        return succeed_distance != self.NO_DISTANCE and succeed_distance <= current_distance
+
+    async def __process_linked_page(self, page_title: str, current_distance: int) -> bool:
+        distance = current_distance + 1
+
+        if self.__should_skip_distance(distance) or page_title.lower() in self.__visited:
+            return False
+
+        page = await self.__api.get_page(page_title)
+        if not page:
+            return False
+
+        if page.word_in_content(self.__target_word):
+            self.__update_succeed_distance(distance)
+            self.__logger.info(
+                f"Worker {self.__worker_id}: Found target word in {page.title} at distance {distance}."
+            )
+            return True
+
+        self.__visited.add(page.title.lower())
+        await self.__queue.put(page)
+        self.__distance_by_page[page.title.lower()] = distance
+        return False
+
+    def __update_succeed_distance(self, distance: int):
+        succeed_distance = self.__succeed_distance["distance"]
+        if succeed_distance == self.NO_DISTANCE or distance < succeed_distance:
+            self.__succeed_distance["distance"] = distance
